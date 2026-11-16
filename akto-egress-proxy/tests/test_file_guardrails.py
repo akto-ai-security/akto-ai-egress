@@ -208,6 +208,15 @@ def test_failed_checks_are_not_remembered(calls):
     assert len(calls) == 2
 
 
+def test_uninspected_allows_are_not_remembered(calls):
+    # guardrails-service let the file through without reading it (OCR down, type unsupported):
+    # the allow says nothing about the content, so the next turn checks the file again.
+    calls.replies = [{"allowed": True, "uninspected": True}, {"allowed": False, "reason": "r"}]
+    assert check(anthropic_body(PNG)) is None
+    assert check(anthropic_body(PNG)) is not None
+    assert len(calls) == 2
+
+
 def test_cache_entries_expire(calls, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(fg.time, "monotonic", lambda: now[0])

@@ -13,7 +13,9 @@ guardrails-service /api/validate/file. guardrails-service picks an extractor (OC
 text for documents) by file extension, so every file is sent with one.
 
 Agents re-send their whole history on every turn, so an allowed file is remembered by its sha256 and
-not checked again for AKTO_FILE_CACHE_TTL seconds. Blocked files are not remembered.
+not checked again for AKTO_FILE_CACHE_TTL seconds. Blocked files are not remembered, and neither is an
+allow that guardrails-service marks "uninspected" (a file it let through without checking its content,
+e.g. while OCR was down), so the file is checked again on the next turn.
 
 The text guardrails get a placeholder in place of each base64 file (scanning base64 as text finds
 nothing and can push the payload over data-ingestion's size limits); restore_files puts the files
@@ -245,7 +247,10 @@ def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Op
                     "reason": verdict.get("reason") or "File blocked by Akto guardrails",
                     "metadata": verdict.get("metadata") or {},
                 }
-            _remember_allowed(batch)
+            if verdict.get("uninspected"):
+                print(f"[AKTO] files allowed without inspection, not remembered: {[f.name for f in batch]}")
+            else:
+                _remember_allowed(batch)
     except FileCheckUnavailable as e:
         if FAIL_OPEN:
             print(f"[AKTO] file guardrails call failed, allowing request: {e}")
