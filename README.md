@@ -19,6 +19,10 @@ docker compose up --build
 | `AKTO_TOKEN` | When data-ingestion authentication is on | Data-ingestion token (the account's database-abstractor JWT). Sent as a bare JWT in the `Authorization` header, with no `Bearer ` prefix. |
 | `AI_HOSTS` | No | Comma-separated hosts to intercept and run guardrails on; `*` matches any run of characters. Defaults to `api.openai.com,api.anthropic.com,chatgpt.com,bedrock-runtime.*.amazonaws.com,bedrock-agent-runtime.*.amazonaws.com`. All other traffic is tunnelled without inspection. |
 | `AKTO_TAGS` | No | Comma-separated `key=value` pairs added to the `tag` sent to Akto (e.g. `env=prod,team=payments`). The built-in `gen-ai` and `source` tags are always sent and cannot be overridden. |
+| `AKTO_FILE_GUARDRAILS` | No | `true` checks the files in AI requests: multipart uploads (e.g. `/v1/files`) and base64 images and documents in JSON bodies (OpenAI, Anthropic, Gemini, Bedrock Converse). Each request's files are sent to `${AKTO_URL}/api/validate/file`, and a blocked file blocks the request with a 403. Needs `FILE_VALIDATION_ENABLED=true` on guardrails-service. Default off. |
+| `AKTO_FILE_MAX_BYTES` | No | Files larger than this are not checked. Default `20971520` (20 MB). |
+| `AKTO_FILE_TIMEOUT` | No | Seconds to wait for a file verdict. Default `30`. Keep it below data-ingestion's `GUARDRAILS_FILE_CLIENT_TIMEOUT_MS`. |
+| `AKTO_FILE_FAIL_OPEN` | No | `false` blocks the request when the file check fails or times out. Default `true` (allow), like the text guardrails. |
 
 To add a provider, add it to `AI_HOSTS` and to the `--ignore-hosts` regex in `docker-compose.yml`. A host is intercepted only if it is in both.
 
