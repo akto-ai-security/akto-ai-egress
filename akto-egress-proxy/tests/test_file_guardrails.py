@@ -54,7 +54,7 @@ def files_in(body: dict):
         id="bedrock"),
 ])
 def test_finds_base64_files_in_json(body, expected):
-    assert [tuple(f) for f in files_in(body)] == expected
+    assert [tuple(f)[:3] for f in files_in(body)] == expected
 
 
 def test_extension_comes_from_the_bytes_when_the_name_has_none():
@@ -86,7 +86,8 @@ def test_finds_multipart_upload_with_binary_content():
         f"Content-Type: image/png\r\n\r\n"
     ).encode() + PNG + f"\r\n--{boundary}--\r\n".encode()
     files = fg.find_files(body, f"multipart/form-data; boundary={boundary}")
-    assert [tuple(f) for f in files] == [("scan.png", "image/png", PNG)]
+    assert [tuple(f)[:3] for f in files] == [("scan.png", "image/png", PNG)]
+    assert files[0].raw is None
 
 
 # ---------- checking files ----------
@@ -112,6 +113,8 @@ class Calls(list):
 def calls(monkeypatch):
     monkeypatch.setattr(fg, "ENABLED", True)
     monkeypatch.setattr(fg, "FAIL_OPEN", True)
+    monkeypatch.setattr(fg, "CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(fg, "_allowed", fg.OrderedDict())
     recorded = Calls()
     recorded.replies = []
 
@@ -133,7 +136,8 @@ def anthropic_body(*blobs):
 
 
 def check(body, token="jwt"):
-    return fg.check_request(body, "application/json", FIELDS, URL, token)
+    files = fg.find_request_files(body, "application/json")
+    return fg.check_files(files, FIELDS, URL, token) if files else None
 
 
 def test_disabled_makes_no_call(calls, monkeypatch):
@@ -166,6 +170,25 @@ def test_blocked_verdict_blocks_with_reason(calls):
     assert check(anthropic_body(PNG)) == {"reason": "prompt injection in image", "metadata": {"policy": "p1"}}
 
 
+# What guardrails-service answers when a policy redacts a file's content (a file can't be sent
+# back redacted, so it blocks): not allowed, but with the engine's "alert" behaviour and a
+# modified flag. The proxy must block on allowed=false alone and never read "alert" as a pass.
+REDACTED_FILE_VERDICT = {
+    "allowed": False, "modified": True, "modifiedPayload": "", "behaviour": "alert",
+    "reason": "file contains sensitive content redacted by guardrail policy (alert)",
+    "metadata": {"policy_name": "PII policy", "rule_violated": "PII-email"},
+}
+
+
+def test_redacted_file_is_blocked_not_sent(calls):
+    calls.replies = [dict(REDACTED_FILE_VERDICT), dict(REDACTED_FILE_VERDICT)]
+    assert check(anthropic_body(PNG)) == {"reason": REDACTED_FILE_VERDICT["reason"],
+                                          "metadata": REDACTED_FILE_VERDICT["metadata"]}
+    # blocked verdicts aren't remembered: the next turn checks the file again
+    assert check(anthropic_body(PNG)) is not None
+    assert len(calls) == 2
+
+
 def test_behaviour_block_blocks_even_if_allowed(calls):
     calls.replies = [{"allowed": True, "behaviour": "BLOCK"}]
     assert check(anthropic_body(PNG))["reason"] == "File blocked by Akto guardrails"
@@ -176,6 +199,78 @@ def test_batches_of_five_and_stops_at_first_block(calls):
     blobs = [PNG + bytes([i]) for i in range(12)]
     assert check(anthropic_body(*blobs))["reason"] == "r"
     assert [len(c["files"]) for c in calls] == [5, 5]
+
+
+def test_allowed_files_are_not_checked_again(calls):
+    other = PNG + b"new"
+    assert check(anthropic_body(PNG)) is None
+    assert check(anthropic_body(PNG, other)) is None  # the next turn re-sends PNG with its history
+    assert [[f[1][1] for f in c["files"]] for c in calls] == [[PNG], [other]]
+
+
+def test_same_file_twice_in_one_request_is_checked_once(calls):
+    check(anthropic_body(PNG, PNG))
+    assert len(calls[0]["files"]) == 1
+
+
+def test_blocked_files_are_not_remembered(calls):
+    calls.replies = [{"allowed": False, "reason": "r"}, {"allowed": False, "reason": "r"}]
+    assert check(anthropic_body(PNG)) is not None
+    assert check(anthropic_body(PNG)) is not None
+    assert len(calls) == 2
+
+
+def test_failed_checks_are_not_remembered(calls):
+    calls.replies = [requests.Timeout("t")]
+    check(anthropic_body(PNG))
+    check(anthropic_body(PNG))
+    assert len(calls) == 2
+
+
+def test_uninspected_allows_are_not_remembered(calls):
+    # guardrails-service let the file through without reading it (OCR down, type unsupported):
+    # the allow says nothing about the content, so the next turn checks the file again.
+    calls.replies = [{"allowed": True, "uninspected": True}, {"allowed": False, "reason": "r"}]
+    assert check(anthropic_body(PNG)) is None
+    assert check(anthropic_body(PNG)) is not None
+    assert len(calls) == 2
+
+
+def test_cache_entries_expire(calls, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(fg.time, "monotonic", lambda: now[0])
+    check(anthropic_body(PNG))
+    now[0] += fg.CACHE_TTL_SECONDS + 1
+    check(anthropic_body(PNG))
+    assert len(calls) == 2
+
+
+def test_cache_off_and_size_limit(calls, monkeypatch):
+    monkeypatch.setattr(fg, "CACHE_SIZE", 1)
+    check(anthropic_body(PNG))
+    check(anthropic_body(PNG + b"2"))  # evicts PNG
+    check(anthropic_body(PNG))
+    monkeypatch.setattr(fg, "CACHE_TTL_SECONDS", 0)
+    check(anthropic_body(PDF))
+    check(anthropic_body(PDF))
+    assert len(calls) == 5
+
+
+# ---------- placeholders ----------
+
+def test_hide_and_restore_round_trip():
+    body = {"model": "m", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "read this"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG_B64}"}},
+        {"type": "image", "source": {"type": "base64", "media_type": "application/pdf", "data": PDF_B64}}]}]}
+    files = files_in(body)
+    text = json.dumps({"messages": body["messages"]})
+
+    hidden = fg.hide_files(text, files)
+    assert PNG_B64 not in hidden and PDF_B64 not in hidden
+    assert "data:image/png;base64,[akto-file sha256:" in hidden
+    assert json.loads(hidden)  # still valid JSON
+    assert fg.restore_files(hidden, files) == text
 
 
 def test_oversized_files_are_skipped(calls, monkeypatch):
@@ -204,8 +299,12 @@ def test_unparseable_body_is_not_checked(calls, monkeypatch):
     def boom(*_):
         raise RuntimeError("bad body")
     monkeypatch.setattr(fg, "find_files", boom)
-    assert check(anthropic_body(PNG)) is None
-    assert calls == []
+    assert fg.find_request_files(anthropic_body(PNG), "application/json") == []
+
+
+def test_disabled_finds_no_files(monkeypatch):
+    monkeypatch.setattr(fg, "ENABLED", False)
+    assert fg.find_request_files(anthropic_body(PNG), "application/json") == []
 
 
 # ---------- the mitmproxy addon ----------
@@ -242,6 +341,21 @@ def test_addon_blocks_request_on_blocked_file_without_text_check(addon, calls):
     assert calls[0]["data"]["path"] == "/v1/messages" and calls[0]["data"]["contextSource"] == "AGENTIC"
 
 
+def test_addon_blocks_a_redacted_file_before_the_text_check(addon, calls, monkeypatch):
+    calls.replies = [dict(REDACTED_FILE_VERDICT)]
+    text_calls = []
+    monkeypatch.setattr(addon, "post_to_akto", lambda params, payload: text_calls.append(payload) or {})
+    flow = anthropic_flow(anthropic_body(PNG))
+    addon.AktoGuardrailsAddon().request(flow)
+
+    assert flow.response.status_code == 403
+    assert flow.response.headers["X-Akto-Guardrails-Decision"] == "blocked"
+    body = json.loads(flow.response.content)
+    assert body["error"] == REDACTED_FILE_VERDICT["reason"]
+    assert body["metadata"] == REDACTED_FILE_VERDICT["metadata"]
+    assert text_calls == []  # the request never reaches the text check, let alone the provider
+
+
 def test_addon_runs_text_check_after_allowed_file(addon, calls, monkeypatch):
     text_calls = []
     monkeypatch.setattr(addon, "post_to_akto", lambda params, payload: text_calls.append(payload) or
@@ -252,3 +366,23 @@ def test_addon_runs_text_check_after_allowed_file(addon, calls, monkeypatch):
     assert flow.response is None
     assert len(calls) == 1 and len(text_calls) == 1
     assert text_calls[0]["path"] == "/v1/messages" and text_calls[0]["tag"] == addon.TAGS
+    # the text check gets a placeholder, not the base64
+    assert PNG_B64 not in text_calls[0]["requestPayload"]
+    assert "[akto-file sha256:" in text_calls[0]["requestPayload"]
+
+
+def test_addon_masking_keeps_the_files(addon, calls, monkeypatch):
+    def mask(params, payload):
+        masked = payload["requestPayload"].replace("my ssn is 123-45-6789", "my ssn is <SSN>")
+        return {"data": {"guardrailsResult": {"Allowed": True, "Modified": True, "ModifiedPayload": masked}}}
+    monkeypatch.setattr(addon, "post_to_akto", mask)
+    body = json.loads(anthropic_body(PNG))
+    body["model"] = "claude"
+    body["messages"][0]["content"].append({"type": "text", "text": "my ssn is 123-45-6789"})
+    flow = anthropic_flow(json.dumps(body).encode())
+    addon.AktoGuardrailsAddon().request(flow)
+
+    sent = json.loads(flow.request.content)
+    assert sent["model"] == "claude"
+    assert sent["messages"][0]["content"][0]["source"]["data"] == PNG_B64
+    assert sent["messages"][0]["content"][1]["text"] == "my ssn is <SSN>"
