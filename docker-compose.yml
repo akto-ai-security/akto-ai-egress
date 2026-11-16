@@ -19,6 +19,10 @@ services:
       AKTO_TOKEN: ${AKTO_TOKEN:-}
       AI_HOSTS: ${AI_HOSTS:-}
       AKTO_TAGS: ${AKTO_TAGS:-}
+      AKTO_FILE_GUARDRAILS: ${AKTO_FILE_GUARDRAILS:-}
+      AKTO_FILE_MAX_BYTES: ${AKTO_FILE_MAX_BYTES:-}
+      AKTO_FILE_TIMEOUT: ${AKTO_FILE_TIMEOUT:-}
+      AKTO_FILE_FAIL_OPEN: ${AKTO_FILE_FAIL_OPEN:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
     expose:

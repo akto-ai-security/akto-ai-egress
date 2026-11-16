@@ -6,7 +6,10 @@ from mitmproxy import ctx, http
 
 import os
 
+import file_guardrails
+
 AKTO_URL = f"{os.getenv('AKTO_URL')}/api/http-proxy" if os.getenv("AKTO_URL") else None
+AKTO_FILE_URL = f"{os.getenv('AKTO_URL')}/api/validate/file" if os.getenv("AKTO_URL") else None
 AKTO_ENABLED = bool(AKTO_URL)
 APP_NAME = os.getenv("APP_NAME")
 # Bare JWT (no "Bearer " prefix) — required when data-ingestion runs with authentication on.
@@ -42,6 +45,7 @@ ALLOW_HOSTS_REGEX = rf"^(?:{AI_HOSTS_PATTERN}):\d+$"
 print(f"[AKTO] URL: {AKTO_URL}")
 print(f"[AKTO] AI hosts: {AI_HOSTS}")
 print(f"[AKTO] tags: {TAGS}")
+print(f"[AKTO] file guardrails: {file_guardrails.ENABLED}")
 
 def is_ai_provider(flow: http.HTTPFlow) -> bool:
     return bool(AI_HOSTS_RE.match(flow.request.pretty_host))
@@ -91,26 +95,35 @@ def apply_masked_request(flow: http.HTTPFlow, modified_payload: str) -> None:
         print(f"[AKTO] could not merge masked request into body, replacing it: {e}")
     flow.request.set_text(modified_payload)
 
+def akto_fields(flow: http.HTTPFlow, status_code: str = "200") -> dict:
+    # The fields both /api/http-proxy and /api/validate/file take.
+    return {
+        "path": flow.request.path,
+        "requestHeaders": minimal_headers(flow.request.headers),
+        "method": flow.request.method,
+        "ip": flow.metadata.get("akto_client_ip") or (flow.client_conn.peername[0] if flow.client_conn.peername else "127.0.0.1"),
+        "time": str(int(time.time() * 1000)),
+        "statusCode": str(status_code),
+        "status": str(status_code),
+        "akto_account_id": "1000000",
+        "akto_vxlan_id": "0",
+        "tag": TAGS,
+        "metadata": json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"}),
+        "contextSource": "AGENTIC",
+    }
+
 def build_akto_payload(
     flow: http.HTTPFlow,
     response_body: str = "",
     status_code: str = "200",
 ) -> dict:
     xx = {
-        "path": flow.request.path,
-        "requestHeaders": minimal_headers(flow.request.headers),
+        **akto_fields(flow, status_code),
         "responseHeaders": safe_headers(flow.response.headers) if flow.response else "{}",
-        "method": flow.request.method,
         "requestPayload": extract_messages(flow),
         "responsePayload": response_body,
-        "ip": flow.metadata.get("akto_client_ip") or (flow.client_conn.peername[0] if flow.client_conn.peername else "127.0.0.1"),
         "destIp": flow.server_conn.ip_address[0] if flow.server_conn.ip_address else "127.0.0.1",
-        "time": str(int(time.time() * 1000)),
-        "statusCode": str(status_code),
         "type": None,
-        "status": str(status_code),
-        "akto_account_id": "1000000",
-        "akto_vxlan_id": "0",
         "is_pending": "false",
         "source": "MIRRORING",
         "direction": None,
@@ -118,9 +131,6 @@ def build_akto_payload(
         "socket_id": None,
         "daemonset_id": None,
         "enabled_graph": None,
-        "tag": TAGS,
-        "metadata": json.dumps({"gen-ai": "Gen AI", "source": "AGENTIC"}),
-        "contextSource": "AGENTIC",
     }
     print("payload", xx)
     return xx
@@ -205,6 +215,18 @@ class AktoGuardrailsAddon:
         client_ip = forwarded_for.split(",")[0].strip()
         if client_ip:
             flow.metadata["akto_client_ip"] = client_ip
+
+        if AKTO_FILE_URL:
+            blocked = file_guardrails.check_request(
+                flow.request.get_content(strict=False) or b"",
+                flow.request.headers.get("content-type", ""),
+                akto_fields(flow),
+                AKTO_FILE_URL,
+                AKTO_TOKEN,
+            )
+            if blocked:
+                flow.response = block_response(**blocked)
+                return
 
         try:
             result = call_akto_request(flow)
