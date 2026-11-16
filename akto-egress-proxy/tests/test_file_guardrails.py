@@ -170,6 +170,25 @@ def test_blocked_verdict_blocks_with_reason(calls):
     assert check(anthropic_body(PNG)) == {"reason": "prompt injection in image", "metadata": {"policy": "p1"}}
 
 
+# What guardrails-service answers when a policy redacts a file's content (a file can't be sent
+# back redacted, so it blocks): not allowed, but with the engine's "alert" behaviour and a
+# modified flag. The proxy must block on allowed=false alone and never read "alert" as a pass.
+REDACTED_FILE_VERDICT = {
+    "allowed": False, "modified": True, "modifiedPayload": "", "behaviour": "alert",
+    "reason": "file contains sensitive content redacted by guardrail policy (alert)",
+    "metadata": {"policy_name": "PII policy", "rule_violated": "PII-email"},
+}
+
+
+def test_redacted_file_is_blocked_not_sent(calls):
+    calls.replies = [dict(REDACTED_FILE_VERDICT), dict(REDACTED_FILE_VERDICT)]
+    assert check(anthropic_body(PNG)) == {"reason": REDACTED_FILE_VERDICT["reason"],
+                                          "metadata": REDACTED_FILE_VERDICT["metadata"]}
+    # blocked verdicts aren't remembered: the next turn checks the file again
+    assert check(anthropic_body(PNG)) is not None
+    assert len(calls) == 2
+
+
 def test_behaviour_block_blocks_even_if_allowed(calls):
     calls.replies = [{"allowed": True, "behaviour": "BLOCK"}]
     assert check(anthropic_body(PNG))["reason"] == "File blocked by Akto guardrails"
@@ -320,6 +339,21 @@ def test_addon_blocks_request_on_blocked_file_without_text_check(addon, calls):
     assert json.loads(flow.response.content)["error"] == "injection in image"
     assert [c["url"] for c in calls] == ["https://akto.example/api/validate/file"]
     assert calls[0]["data"]["path"] == "/v1/messages" and calls[0]["data"]["contextSource"] == "AGENTIC"
+
+
+def test_addon_blocks_a_redacted_file_before_the_text_check(addon, calls, monkeypatch):
+    calls.replies = [dict(REDACTED_FILE_VERDICT)]
+    text_calls = []
+    monkeypatch.setattr(addon, "post_to_akto", lambda params, payload: text_calls.append(payload) or {})
+    flow = anthropic_flow(anthropic_body(PNG))
+    addon.AktoGuardrailsAddon().request(flow)
+
+    assert flow.response.status_code == 403
+    assert flow.response.headers["X-Akto-Guardrails-Decision"] == "blocked"
+    body = json.loads(flow.response.content)
+    assert body["error"] == REDACTED_FILE_VERDICT["reason"]
+    assert body["metadata"] == REDACTED_FILE_VERDICT["metadata"]
+    assert text_calls == []  # the request never reaches the text check, let alone the provider
 
 
 def test_addon_runs_text_check_after_allowed_file(addon, calls, monkeypatch):
