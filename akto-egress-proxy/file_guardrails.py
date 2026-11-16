@@ -11,10 +11,20 @@ Files come from two places:
 The files go as multipart to data-ingestion-service /api/validate/file, which forwards them to
 guardrails-service /api/validate/file. guardrails-service picks an extractor (OCR for images,
 text for documents) by file extension, so every file is sent with one.
+
+Agents re-send their whole history on every turn, so an allowed file is remembered by its sha256 and
+not checked again for AKTO_FILE_CACHE_TTL seconds. Blocked files are not remembered.
+
+The text guardrails get a placeholder in place of each base64 file (scanning base64 as text finds
+nothing and can push the payload over data-ingestion's size limits); restore_files puts the files
+back into a masked payload before it is merged into the request.
 """
 import base64
 import binascii
+import hashlib
 import json
+import time
+from collections import OrderedDict
 import mimetypes
 import os
 import re
@@ -31,6 +41,10 @@ TIMEOUT_SECONDS = float(os.getenv("AKTO_FILE_TIMEOUT") or 30)
 FAIL_OPEN = (os.getenv("AKTO_FILE_FAIL_OPEN") or "true").lower() != "false"
 # guardrails-service checks at most FILE_VALIDATE_MAX_FILES (default 5) files per call.
 BATCH_SIZE = 5
+# Seconds an allowed file is remembered; 0 turns the cache off. Policy changes reach a remembered file
+# only after it expires.
+CACHE_TTL_SECONDS = float(os.getenv("AKTO_FILE_CACHE_TTL") or 3600)
+CACHE_SIZE = int(os.getenv("AKTO_FILE_CACHE_SIZE") or 1024)
 
 DATA_URL_RE = re.compile(r"^data:([\w.+-]+/[\w.+-]+)?(?:;[^,;]*)*;base64,", re.IGNORECASE)
 MAGIC = [
@@ -45,6 +59,39 @@ class File(NamedTuple):
     name: str
     mime: str
     data: bytes
+    sha256: str
+    raw: Optional[str]  # the base64 text as it appears in a JSON body; None for multipart parts
+
+    @property
+    def placeholder(self) -> str:
+        return f"[akto-file sha256:{self.sha256[:16]}]"
+
+
+# sha256 -> time until which the file counts as allowed; oldest first. The mitmproxy hooks run on one
+# thread, so no lock is needed.
+_allowed: "OrderedDict[str, float]" = OrderedDict()
+
+
+def _recently_allowed(sha256: str) -> bool:
+    expires = _allowed.get(sha256)
+    if expires is None:
+        return False
+    if expires <= time.monotonic():
+        del _allowed[sha256]
+        return False
+    _allowed.move_to_end(sha256)
+    return True
+
+
+def _remember_allowed(files: list) -> None:
+    if CACHE_TTL_SECONDS <= 0:
+        return
+    expires = time.monotonic() + CACHE_TTL_SECONDS
+    for f in files:
+        _allowed[f.sha256] = expires
+        _allowed.move_to_end(f.sha256)
+    while len(_allowed) > CACHE_SIZE:
+        _allowed.popitem(last=False)
 
 
 class FileCheckUnavailable(Exception):
@@ -57,13 +104,13 @@ def _sniff_extension(data: bytes) -> str:
     return next((ext for magic, ext in MAGIC if data.startswith(magic)), "")
 
 
-def _make_file(name: Optional[str], mime: Optional[str], data: bytes, index: int) -> File:
+def _make_file(name: Optional[str], mime: Optional[str], data: bytes, raw: Optional[str], index: int) -> File:
     """Give the file a name with an extension: the caller's name if it has one, else the
     content's magic bytes, else the declared mime type."""
     name = os.path.basename(name or "") or f"attachment-{index}"
     if not os.path.splitext(name)[1]:
         name += _sniff_extension(data) or (mimetypes.guess_extension(mime or "") or "")
-    return File(name, mime or "application/octet-stream", data)
+    return File(name, mime or "application/octet-stream", data, hashlib.sha256(data).hexdigest(), raw)
 
 
 def _b64decode(value) -> Optional[bytes]:
@@ -76,12 +123,12 @@ def _b64decode(value) -> Optional[bytes]:
 
 
 def _from_json(node, found: list, filename: Optional[str] = None) -> None:
-    """Collect (name, mime, bytes) for every base64 file inside a decoded JSON body."""
+    """Collect (name, mime, bytes, base64 text) for every base64 file inside a decoded JSON body."""
     if isinstance(node, str):
         match = DATA_URL_RE.match(node)
         data = _b64decode(node[match.end():]) if match else None
         if data is not None:
-            found.append((filename, match.group(1), data))
+            found.append((filename, match.group(1), data, node[match.end():]))
         return
     if isinstance(node, list):
         for item in node:
@@ -94,14 +141,14 @@ def _from_json(node, found: list, filename: Optional[str] = None) -> None:
     if node.get("type") == "base64" and "data" in node:
         data = _b64decode(node["data"])
         if data is not None:
-            found.append((filename, node.get("media_type"), data))
+            found.append((filename, node.get("media_type"), data, node["data"]))
         return
     # Gemini: {"inline_data": {"mime_type": "...", "data": "..."}} (camelCase in the REST API)
     inline = node.get("inline_data") or node.get("inlineData")
     if isinstance(inline, dict):
         data = _b64decode(inline.get("data"))
         if data is not None:
-            found.append((filename, inline.get("mime_type") or inline.get("mimeType"), data))
+            found.append((filename, inline.get("mime_type") or inline.get("mimeType"), data, inline["data"]))
         return
     # Bedrock Converse: {"format": "png", "name": "...", "source": {"bytes": "..."}}
     source = node.get("source")
@@ -109,7 +156,7 @@ def _from_json(node, found: list, filename: Optional[str] = None) -> None:
         data = _b64decode(source["bytes"])
         if data is not None:
             name = node.get("name") or filename or "attachment"
-            found.append((f"{name}.{node['format']}", None, data))
+            found.append((f"{name}.{node['format']}", None, data, source["bytes"]))
         return
 
     # OpenAI keeps the name next to the data URL: {"filename": "a.pdf", "file_data": "data:..."}
@@ -130,12 +177,12 @@ def _from_multipart(body: bytes, content_type: str) -> list:
         if name is None:
             continue
         mime = part.get_content_type() if part.get("Content-Type") else None
-        found.append((name, mime, part.get_payload(decode=True) or b""))
+        found.append((name, mime, part.get_payload(decode=True) or b"", None))
     return found
 
 
 def find_files(body: bytes, content_type: str) -> list:
-    """Every file in a request body, as File(name, mime, data)."""
+    """Every file in a request body."""
     if not body:
         return []
     if (content_type or "").lower().startswith("multipart/form-data"):
@@ -147,7 +194,7 @@ def find_files(body: bytes, content_type: str) -> list:
             return []
         found = []
         _from_json(parsed, found)
-    return [_make_file(name, mime, data, i) for i, (name, mime, data) in enumerate(found, 1)]
+    return [_make_file(name, mime, data, raw, i) for i, (name, mime, data, raw) in enumerate(found, 1)]
 
 
 def _validate(batch: list, fields: dict, url: str, token: Optional[str]) -> dict:
@@ -165,33 +212,40 @@ def _validate(batch: list, fields: dict, url: str, token: Optional[str]) -> dict
     return verdict
 
 
-def check_request(body: bytes, content_type: str, fields: dict, url: str, token: Optional[str]) -> Optional[dict]:
-    """Check the files in a request. Returns {"reason", "metadata"} to block it, else None."""
+def find_request_files(body: bytes, content_type: str) -> list:
+    """The files to check in a request; none when file guardrails are off or the body can't be read."""
     if not ENABLED:
-        return None
+        return []
     try:
-        found = find_files(body, content_type)
+        return find_files(body, content_type)
     except Exception as e:  # a body we can't parse must not break the request
         print(f"[AKTO] could not read files from request, not checked: {e}")
-        return None
-    files = []
-    for f in found:
+        return []
+
+
+def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Optional[dict]:
+    """Check the files of a request. Returns {"reason", "metadata"} to block it, else None."""
+    pending = {}
+    for f in files:
         if len(f.data) > MAX_BYTES:
             print(f"[AKTO] file {f.name} is {len(f.data)} bytes, over AKTO_FILE_MAX_BYTES; not checked")
-        else:
-            files.append(f)
-    if not files:
+        elif f.sha256 not in pending and not _recently_allowed(f.sha256):
+            pending[f.sha256] = f
+    if not pending:
         return None
 
+    files = list(pending.values())
     print(f"[AKTO] checking {len(files)} file(s): {[f.name for f in files]}")
     try:
         for start in range(0, len(files), BATCH_SIZE):
-            verdict = _validate(files[start:start + BATCH_SIZE], fields, url, token)
+            batch = files[start:start + BATCH_SIZE]
+            verdict = _validate(batch, fields, url, token)
             if verdict.get("allowed") is False or (verdict.get("behaviour") or "").lower() == "block":
                 return {
                     "reason": verdict.get("reason") or "File blocked by Akto guardrails",
                     "metadata": verdict.get("metadata") or {},
                 }
+            _remember_allowed(batch)
     except FileCheckUnavailable as e:
         if FAIL_OPEN:
             print(f"[AKTO] file guardrails call failed, allowing request: {e}")
@@ -199,3 +253,22 @@ def check_request(body: bytes, content_type: str, fields: dict, url: str, token:
         print(f"[AKTO] file guardrails call failed, blocking request: {e}")
         return {"reason": "File guardrails unavailable", "metadata": {}}
     return None
+
+
+def hide_files(text: str, files: list) -> str:
+    """Swap each base64 file in a JSON text payload for its placeholder."""
+    for f in files:
+        if f.raw:
+            text = text.replace(f.raw, f.placeholder)
+    return text
+
+
+def restore_files(text: str, files: list) -> str:
+    """Put the base64 files back into a payload that hide_files produced."""
+    for f in files:
+        if not f.raw:
+            continue
+        if f.placeholder not in text:
+            print(f"[AKTO] masked payload lost file {f.name}; it will be missing from the request")
+        text = text.replace(f.placeholder, f.raw)
+    return text

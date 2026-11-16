@@ -63,16 +63,19 @@ def minimal_headers(headers) -> str:
         result["host"] = APP_NAME
     return json.dumps(result) if result else "{}"
 
+def request_files(flow: http.HTTPFlow) -> list:
+    return flow.metadata.get("akto_files") or []
+
 def extract_messages(flow: http.HTTPFlow) -> str:
     try:
         body = flow.request.get_text(strict=False) or ""
         data = json.loads(body)
 
         if "messages" in data:
-            return json.dumps({"messages": data["messages"]})
+            return file_guardrails.hide_files(json.dumps({"messages": data["messages"]}), request_files(flow))
 
         # fallback if structure changes
-        return json.dumps({"raw": data})
+        return file_guardrails.hide_files(json.dumps({"raw": data}), request_files(flow))
 
     except Exception:
         return ""
@@ -81,6 +84,7 @@ def apply_masked_request(flow: http.HTTPFlow, modified_payload: str) -> None:
     # Akto masks the payload extract_messages sent ({"messages": ...} or {"raw": ...}), not the
     # provider body. Put the masked messages back into the original body so provider fields
     # such as model and max_tokens survive; replacing the whole body would drop them.
+    modified_payload = file_guardrails.restore_files(modified_payload, request_files(flow))
     try:
         masked = json.loads(modified_payload)
         if "messages" in masked:
@@ -216,14 +220,13 @@ class AktoGuardrailsAddon:
         if client_ip:
             flow.metadata["akto_client_ip"] = client_ip
 
-        if AKTO_FILE_URL:
-            blocked = file_guardrails.check_request(
-                flow.request.get_content(strict=False) or b"",
-                flow.request.headers.get("content-type", ""),
-                akto_fields(flow),
-                AKTO_FILE_URL,
-                AKTO_TOKEN,
-            )
+        files = file_guardrails.find_request_files(
+            flow.request.get_content(strict=False) or b"",
+            flow.request.headers.get("content-type", ""),
+        )
+        flow.metadata["akto_files"] = files
+        if files and AKTO_FILE_URL:
+            blocked = file_guardrails.check_files(files, akto_fields(flow), AKTO_FILE_URL, AKTO_TOKEN)
             if blocked:
                 flow.response = block_response(**blocked)
                 return
