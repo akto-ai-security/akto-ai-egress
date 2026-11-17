@@ -302,6 +302,19 @@ def test_unparseable_body_is_not_checked(calls, monkeypatch):
     assert fg.find_request_files(anthropic_body(PNG), "application/json") == []
 
 
+@pytest.mark.parametrize("value, enabled", [(None, True), ("", True), ("true", True), ("false", False), ("FALSE", False)])
+def test_file_guardrails_are_on_unless_turned_off(monkeypatch, value, enabled):
+    if value is None:
+        monkeypatch.delenv("AKTO_FILE_GUARDRAILS", raising=False)
+    else:
+        monkeypatch.setenv("AKTO_FILE_GUARDRAILS", value)
+    try:
+        assert importlib.reload(fg).ENABLED is enabled
+    finally:
+        monkeypatch.undo()
+        importlib.reload(fg)
+
+
 def test_disabled_finds_no_files(monkeypatch):
     monkeypatch.setattr(fg, "ENABLED", False)
     assert fg.find_request_files(anthropic_body(PNG), "application/json") == []
