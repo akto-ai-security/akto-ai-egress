@@ -36,7 +36,8 @@ from typing import NamedTuple, Optional
 
 import requests
 
-ENABLED = (os.getenv("AKTO_FILE_GUARDRAILS") or "").lower() == "true"
+# On unless AKTO_FILE_GUARDRAILS=false. Only requests that carry a file not allowed recently make a call.
+ENABLED = (os.getenv("AKTO_FILE_GUARDRAILS") or "true").lower() != "false"
 MAX_BYTES = int(os.getenv("AKTO_FILE_MAX_BYTES") or 20 * 1024 * 1024)
 TIMEOUT_SECONDS = float(os.getenv("AKTO_FILE_TIMEOUT") or 30)
 # true (default): an unreachable or failing check lets the request through, like the text guardrails.
