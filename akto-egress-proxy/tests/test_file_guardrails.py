@@ -113,8 +113,6 @@ class Calls(list):
 def calls(monkeypatch):
     monkeypatch.setattr(fg, "ENABLED", True)
     monkeypatch.setattr(fg, "FAIL_OPEN", True)
-    monkeypatch.setattr(fg, "CACHE_TTL_SECONDS", 3600)
-    monkeypatch.setattr(fg, "_allowed", fg.OrderedDict())
     recorded = Calls()
     recorded.replies = []
 
@@ -184,9 +182,7 @@ def test_redacted_file_is_blocked_not_sent(calls):
     calls.replies = [dict(REDACTED_FILE_VERDICT), dict(REDACTED_FILE_VERDICT)]
     assert check(anthropic_body(PNG)) == {"reason": REDACTED_FILE_VERDICT["reason"],
                                           "metadata": REDACTED_FILE_VERDICT["metadata"]}
-    # blocked verdicts aren't remembered: the next turn checks the file again
-    assert check(anthropic_body(PNG)) is not None
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_behaviour_block_blocks_even_if_allowed(calls):
@@ -201,59 +197,18 @@ def test_batches_of_five_and_stops_at_first_block(calls):
     assert [len(c["files"]) for c in calls] == [5, 5]
 
 
-def test_allowed_files_are_not_checked_again(calls):
+def test_every_request_sends_its_files(calls):
+    # The proxy keeps no cache: a re-sent file goes to guardrails-service again, which answers it from
+    # its own cache, so a policy change applies at once and every replica sees the same verdicts.
     other = PNG + b"new"
     assert check(anthropic_body(PNG)) is None
     assert check(anthropic_body(PNG, other)) is None  # the next turn re-sends PNG with its history
-    assert [[f[1][1] for f in c["files"]] for c in calls] == [[PNG], [other]]
+    assert [[f[1][1] for f in c["files"]] for c in calls] == [[PNG], [PNG, other]]
 
 
 def test_same_file_twice_in_one_request_is_checked_once(calls):
     check(anthropic_body(PNG, PNG))
     assert len(calls[0]["files"]) == 1
-
-
-def test_blocked_files_are_not_remembered(calls):
-    calls.replies = [{"allowed": False, "reason": "r"}, {"allowed": False, "reason": "r"}]
-    assert check(anthropic_body(PNG)) is not None
-    assert check(anthropic_body(PNG)) is not None
-    assert len(calls) == 2
-
-
-def test_failed_checks_are_not_remembered(calls):
-    calls.replies = [requests.Timeout("t")]
-    check(anthropic_body(PNG))
-    check(anthropic_body(PNG))
-    assert len(calls) == 2
-
-
-def test_uninspected_allows_are_not_remembered(calls):
-    # guardrails-service let the file through without reading it (OCR down, type unsupported):
-    # the allow says nothing about the content, so the next turn checks the file again.
-    calls.replies = [{"allowed": True, "uninspected": True}, {"allowed": False, "reason": "r"}]
-    assert check(anthropic_body(PNG)) is None
-    assert check(anthropic_body(PNG)) is not None
-    assert len(calls) == 2
-
-
-def test_cache_entries_expire(calls, monkeypatch):
-    now = [1000.0]
-    monkeypatch.setattr(fg.time, "monotonic", lambda: now[0])
-    check(anthropic_body(PNG))
-    now[0] += fg.CACHE_TTL_SECONDS + 1
-    check(anthropic_body(PNG))
-    assert len(calls) == 2
-
-
-def test_cache_off_and_size_limit(calls, monkeypatch):
-    monkeypatch.setattr(fg, "CACHE_SIZE", 1)
-    check(anthropic_body(PNG))
-    check(anthropic_body(PNG + b"2"))  # evicts PNG
-    check(anthropic_body(PNG))
-    monkeypatch.setattr(fg, "CACHE_TTL_SECONDS", 0)
-    check(anthropic_body(PDF))
-    check(anthropic_body(PDF))
-    assert len(calls) == 5
 
 
 # ---------- placeholders ----------
