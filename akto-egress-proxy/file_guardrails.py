@@ -12,10 +12,10 @@ The files go as multipart to data-ingestion-service /api/validate/file, which fo
 guardrails-service /api/validate/file. guardrails-service picks an extractor (OCR for images,
 text for documents) by file extension, so every file is sent with one.
 
-Agents re-send their whole history on every turn, so an allowed file is remembered by its sha256 and
-not checked again for AKTO_FILE_CACHE_TTL seconds. Blocked files are not remembered, and neither is an
-allow that guardrails-service marks "uninspected" (a file it let through without checking its content,
-e.g. while OCR was down), so the file is checked again on the next turn.
+Agents re-send their whole history on every turn, so the same files come back every turn. The proxy
+keeps no state: every request's files are sent, and guardrails-service remembers the ones it already
+inspected and allowed (in its Redis, keyed on the bytes and the policies that apply), so a re-sent file
+is answered without being extracted or scanned again, and a policy change applies at once.
 
 The text guardrails get a placeholder in place of each base64 file (scanning base64 as text finds
 nothing and can push the payload over data-ingestion's size limits); restore_files puts the files
@@ -25,8 +25,6 @@ import base64
 import binascii
 import hashlib
 import json
-import time
-from collections import OrderedDict
 import mimetypes
 import os
 import re
@@ -36,7 +34,7 @@ from typing import NamedTuple, Optional
 
 import requests
 
-# On unless AKTO_FILE_GUARDRAILS=false. Only requests that carry a file not allowed recently make a call.
+# On unless AKTO_FILE_GUARDRAILS=false. Only requests that carry a file make a call.
 ENABLED = (os.getenv("AKTO_FILE_GUARDRAILS") or "true").lower() != "false"
 MAX_BYTES = int(os.getenv("AKTO_FILE_MAX_BYTES") or 20 * 1024 * 1024)
 TIMEOUT_SECONDS = float(os.getenv("AKTO_FILE_TIMEOUT") or 30)
@@ -44,10 +42,6 @@ TIMEOUT_SECONDS = float(os.getenv("AKTO_FILE_TIMEOUT") or 30)
 FAIL_OPEN = (os.getenv("AKTO_FILE_FAIL_OPEN") or "true").lower() != "false"
 # guardrails-service checks at most FILE_VALIDATE_MAX_FILES (default 5) files per call.
 BATCH_SIZE = 5
-# Seconds an allowed file is remembered; 0 turns the cache off. Policy changes reach a remembered file
-# only after it expires.
-CACHE_TTL_SECONDS = float(os.getenv("AKTO_FILE_CACHE_TTL") or 3600)
-CACHE_SIZE = int(os.getenv("AKTO_FILE_CACHE_SIZE") or 1024)
 
 DATA_URL_RE = re.compile(r"^data:([\w.+-]+/[\w.+-]+)?(?:;[^,;]*)*;base64,", re.IGNORECASE)
 MAGIC = [
@@ -68,33 +62,6 @@ class File(NamedTuple):
     @property
     def placeholder(self) -> str:
         return f"[akto-file sha256:{self.sha256[:16]}]"
-
-
-# sha256 -> time until which the file counts as allowed; oldest first. The mitmproxy hooks run on one
-# thread, so no lock is needed.
-_allowed: "OrderedDict[str, float]" = OrderedDict()
-
-
-def _recently_allowed(sha256: str) -> bool:
-    expires = _allowed.get(sha256)
-    if expires is None:
-        return False
-    if expires <= time.monotonic():
-        del _allowed[sha256]
-        return False
-    _allowed.move_to_end(sha256)
-    return True
-
-
-def _remember_allowed(files: list) -> None:
-    if CACHE_TTL_SECONDS <= 0:
-        return
-    expires = time.monotonic() + CACHE_TTL_SECONDS
-    for f in files:
-        _allowed[f.sha256] = expires
-        _allowed.move_to_end(f.sha256)
-    while len(_allowed) > CACHE_SIZE:
-        _allowed.popitem(last=False)
 
 
 class FileCheckUnavailable(Exception):
@@ -232,8 +199,8 @@ def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Op
     for f in files:
         if len(f.data) > MAX_BYTES:
             print(f"[AKTO] file {f.name} is {len(f.data)} bytes, over AKTO_FILE_MAX_BYTES; not checked")
-        elif f.sha256 not in pending and not _recently_allowed(f.sha256):
-            pending[f.sha256] = f
+        else:
+            pending.setdefault(f.sha256, f)  # the same file twice in one request is sent once
     if not pending:
         return None
 
@@ -249,9 +216,7 @@ def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Op
                     "metadata": verdict.get("metadata") or {},
                 }
             if verdict.get("uninspected"):
-                print(f"[AKTO] files allowed without inspection, not remembered: {[f.name for f in batch]}")
-            else:
-                _remember_allowed(batch)
+                print(f"[AKTO] files allowed without inspection: {[f.name for f in batch]}")
     except FileCheckUnavailable as e:
         if FAIL_OPEN:
             print(f"[AKTO] file guardrails call failed, allowing request: {e}")

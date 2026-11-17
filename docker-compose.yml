@@ -23,8 +23,6 @@ services:
       AKTO_FILE_MAX_BYTES: ${AKTO_FILE_MAX_BYTES:-}
       AKTO_FILE_TIMEOUT: ${AKTO_FILE_TIMEOUT:-}
       AKTO_FILE_FAIL_OPEN: ${AKTO_FILE_FAIL_OPEN:-}
-      AKTO_FILE_CACHE_TTL: ${AKTO_FILE_CACHE_TTL:-}
-      AKTO_FILE_CACHE_SIZE: ${AKTO_FILE_CACHE_SIZE:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
     expose:
