@@ -21,6 +21,10 @@ docker compose up --build
 | `AKTO_TAGS` | No | Comma-separated `key=value` pairs added to the `tag` sent to Akto (e.g. `env=prod,team=payments`). The built-in `gen-ai` and `source` tags are always sent and cannot be overridden. |
 | `AKTO_STREAM_GUARDRAILS` | No | Streamed answers (Anthropic Messages, OpenAI Chat Completions and Responses) are checked in pieces as they arrive, and each piece is forwarded once it passes. A blocked piece ends the stream with the provider's own error event. On by default; `false` holds the whole stream and checks it once at the end, as before. |
 | `AKTO_STREAM_CHUNK_CHARS` | No | Characters of model text per check on a streamed answer (default `300`). Smaller pieces start flowing sooner but make more guardrail calls. |
+| `AKTO_FILE_GUARDRAILS` | No | On by default; `false` turns it off. Checks the files in AI requests: multipart uploads (e.g. `/v1/files`) and base64 images and documents in JSON bodies (OpenAI, Anthropic, Gemini, Bedrock Converse). Each request's files are sent to `${AKTO_URL}/api/validate/file`, and a blocked file blocks the request with a 403. The text guardrails see a `[akto-file sha256:…]` placeholder in place of each base64 file. Requests without a file make no file call. guardrails-service remembers files it already inspected and allowed, so the copies an agent re-sends every turn are answered without being scanned again. Needs file validation on in guardrails-service (`FILE_VALIDATION_ENABLED`, on by default). |
+| `AKTO_FILE_MAX_BYTES` | No | Files larger than this are not checked. Default `20971520` (20 MB). |
+| `AKTO_FILE_TIMEOUT` | No | Seconds to wait for a file verdict. Default `30`. Keep it below data-ingestion's `GUARDRAILS_FILE_CLIENT_TIMEOUT_MS`. |
+| `AKTO_FILE_FAIL_OPEN` | No | `false` blocks the request when the file check fails or times out. Default `true` (allow), like the text guardrails. |
 
 To add a provider, add it to `AI_HOSTS` and to the `--ignore-hosts` regex in `docker-compose.yml`. A host is intercepted only if it is in both.
 

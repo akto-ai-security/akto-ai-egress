@@ -21,6 +21,10 @@ services:
       AKTO_TAGS: ${AKTO_TAGS:-}
       AKTO_STREAM_GUARDRAILS: ${AKTO_STREAM_GUARDRAILS:-}
       AKTO_STREAM_CHUNK_CHARS: ${AKTO_STREAM_CHUNK_CHARS:-}
+      AKTO_FILE_GUARDRAILS: ${AKTO_FILE_GUARDRAILS:-}
+      AKTO_FILE_MAX_BYTES: ${AKTO_FILE_MAX_BYTES:-}
+      AKTO_FILE_TIMEOUT: ${AKTO_FILE_TIMEOUT:-}
+      AKTO_FILE_FAIL_OPEN: ${AKTO_FILE_FAIL_OPEN:-}
     volumes:
       - ./mitmproxy-data:/home/mitmproxy/.mitmproxy
     expose:
