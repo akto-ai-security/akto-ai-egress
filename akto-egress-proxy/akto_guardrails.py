@@ -66,16 +66,19 @@ def minimal_headers(headers) -> str:
 def request_files(flow: http.HTTPFlow) -> list:
     return flow.metadata.get("akto_files") or []
 
+def file_checks(flow: http.HTTPFlow) -> dict:
+    return flow.metadata.get("akto_file_checks") or {}
+
 def extract_messages(flow: http.HTTPFlow) -> str:
     try:
         body = flow.request.get_text(strict=False) or ""
         data = json.loads(body)
 
         if "messages" in data:
-            return file_guardrails.hide_files(json.dumps({"messages": data["messages"]}), request_files(flow))
+            return file_guardrails.hide_files(json.dumps({"messages": data["messages"]}), request_files(flow), file_checks(flow))
 
         # fallback if structure changes
-        return file_guardrails.hide_files(json.dumps({"raw": data}), request_files(flow))
+        return file_guardrails.hide_files(json.dumps({"raw": data}), request_files(flow), file_checks(flow))
 
     except Exception:
         return ""
@@ -84,7 +87,7 @@ def apply_masked_request(flow: http.HTTPFlow, modified_payload: str) -> None:
     # Akto masks the payload extract_messages sent ({"messages": ...} or {"raw": ...}), not the
     # provider body. Put the masked messages back into the original body so provider fields
     # such as model and max_tokens survive; replacing the whole body would drop them.
-    modified_payload = file_guardrails.restore_files(modified_payload, request_files(flow))
+    modified_payload = file_guardrails.restore_files(modified_payload, request_files(flow), file_checks(flow))
     try:
         masked = json.loads(modified_payload)
         if "messages" in masked:
@@ -147,6 +150,20 @@ def post_to_akto(params: dict, payload: dict) -> dict:
     r = requests.post(AKTO_URL, params=params, headers=headers, json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
+
+
+def ingest_blocked_request(flow: http.HTTPFlow) -> None:
+    """A request the file check blocked never reaches the text check, whose call is also what ingests traffic
+    for Traces, so it would leave no trace. Ingest it on its own - no guardrails re-run - with the 403 the agent
+    got. Best effort: the block stands either way."""
+    try:
+        post_to_akto(
+            {"ingest_data": "true"},
+            build_akto_payload(flow, response_body=flow.response.get_text(strict=False) or "",
+                               status_code=str(flow.response.status_code)),
+        )
+    except Exception as e:
+        print(f"[AKTO] could not ingest the file-blocked request: {e}")
 
 
 def call_akto_request(flow: http.HTTPFlow) -> dict:
@@ -225,10 +242,12 @@ class AktoGuardrailsAddon:
             flow.request.headers.get("content-type", ""),
         )
         flow.metadata["akto_files"] = files
+        flow.metadata["akto_file_checks"] = checks = {}
         if files and AKTO_FILE_URL:
-            blocked = file_guardrails.check_files(files, akto_fields(flow), AKTO_FILE_URL, AKTO_TOKEN)
+            blocked = file_guardrails.check_files(files, akto_fields(flow), AKTO_FILE_URL, AKTO_TOKEN, checks)
             if blocked:
                 flow.response = block_response(**blocked)
+                ingest_blocked_request(flow)
                 return
 
         try:

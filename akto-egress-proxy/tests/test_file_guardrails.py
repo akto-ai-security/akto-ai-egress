@@ -116,8 +116,8 @@ def calls(monkeypatch):
     recorded = Calls()
     recorded.replies = []
 
-    def post(url, data=None, files=None, headers=None, timeout=None, **_):
-        recorded.append({"url": url, "data": data, "files": files, "headers": headers})
+    def post(url, data=None, files=None, headers=None, timeout=None, params=None, json=None, **_):
+        recorded.append({"url": url, "data": data, "files": files, "headers": headers, "params": params, "json": json})
         reply = recorded.replies.pop(0) if recorded.replies else {"allowed": True}
         if isinstance(reply, Exception):
             raise reply
@@ -221,11 +221,44 @@ def test_hide_and_restore_round_trip():
     files = files_in(body)
     text = json.dumps({"messages": body["messages"]})
 
-    hidden = fg.hide_files(text, files)
+    checks = {files[0].sha256: fg.ALLOWED, files[1].sha256: fg.UNINSPECTED}
+    hidden = fg.hide_files(text, files, checks)
     assert PNG_B64 not in hidden and PDF_B64 not in hidden
-    assert "data:image/png;base64,[akto-file sha256:" in hidden
+    assert f"data:image/png;base64,[akto-file sha256:{files[0].sha256[:16]} name=attachment-1.png check=allowed]" in hidden
+    assert "check=uninspected]" in hidden
     assert json.loads(hidden)  # still valid JSON
-    assert fg.restore_files(hidden, files) == text
+    assert fg.restore_files(hidden, files, checks) == text
+
+
+def test_placeholder_name_is_json_safe():
+    f = fg.File('a"b]\\c d.png', "image/png", PNG, "ab" * 32, PNG_B64)
+    marker = fg.placeholder(f, {f.sha256: fg.BLOCKED})
+    assert marker == f"[akto-file sha256:{'ab' * 8} name=a_b__c_d.png check=blocked]"
+    assert json.loads(json.dumps({"x": marker}))["x"] == marker
+    assert fg.placeholder(f).endswith("check=unchecked]")  # no outcome recorded
+
+
+@pytest.mark.parametrize("replies, outcomes", [
+    pytest.param([{"allowed": True}], [fg.ALLOWED] * 7, id="all-allowed"),
+    pytest.param([{"allowed": True, "uninspected": True}, {"allowed": True}], [fg.UNINSPECTED] * 5 + [fg.ALLOWED] * 2, id="first-batch-uninspected"),
+    pytest.param([{"allowed": False, "reason": "r"}], [fg.BLOCKED] * 5 + [fg.NOT_REACHED] * 2, id="blocked-batch-stops-the-rest"),
+    pytest.param([{"allowed": True}, {"allowed": False, "reason": "r"}], [fg.ALLOWED] * 5 + [fg.BLOCKED] * 2, id="second-batch-blocked"),
+    pytest.param([requests.Timeout("t")], [fg.UNCHECKED] * 7, id="check-failed"),
+])
+def test_check_files_records_each_files_outcome(calls, replies, outcomes):
+    calls.replies = list(replies)
+    files = fg.find_request_files(anthropic_body(*[PNG + bytes([i]) for i in range(7)]), "application/json")
+    checks = {}
+    fg.check_files(files, FIELDS, URL, "jwt", checks)
+    assert [checks[f.sha256] for f in files] == outcomes
+
+
+def test_oversized_files_are_recorded_unchecked(calls, monkeypatch):
+    monkeypatch.setattr(fg, "MAX_BYTES", len(PNG))
+    files = fg.find_request_files(anthropic_body(PNG, PNG + b"too-big"), "application/json")
+    checks = {}
+    fg.check_files(files, FIELDS, URL, "jwt", checks)
+    assert [checks[f.sha256] for f in files] == [fg.ALLOWED, fg.UNCHECKED]
 
 
 def test_oversized_files_are_skipped(calls, monkeypatch):
@@ -305,14 +338,29 @@ def test_addon_blocks_request_on_blocked_file_without_text_check(addon, calls):
     assert flow.response.status_code == 403
     assert flow.response.headers["X-Akto-Guardrails-Decision"] == "blocked"
     assert json.loads(flow.response.content)["error"] == "injection in image"
-    assert [c["url"] for c in calls] == ["https://akto.example/api/validate/file"]
+    assert [c["url"] for c in calls] == ["https://akto.example/api/validate/file", "https://akto.example/api/http-proxy"]
     assert calls[0]["data"]["path"] == "/v1/messages" and calls[0]["data"]["contextSource"] == "AGENTIC"
+    # The blocked request is still ingested for Traces: ingest only (no text guardrails re-run), with the 403
+    # the agent got, and the image as a placeholder that says it was blocked.
+    ingest = calls[1]
+    assert ingest["params"] == {"ingest_data": "true"}
+    assert ingest["json"]["statusCode"] == "403" and ingest["json"]["path"] == "/v1/messages"
+    assert "injection in image" in ingest["json"]["responsePayload"]
+    assert PNG_B64 not in ingest["json"]["requestPayload"]
+    assert "name=attachment-1.png check=blocked]" in ingest["json"]["requestPayload"]
+
+
+def test_addon_block_stands_when_ingesting_it_fails(addon, calls):
+    calls.replies = [{"allowed": False, "reason": "injection in image"}, requests.ConnectionError("down")]
+    flow = anthropic_flow(anthropic_body(PNG))
+    addon.AktoGuardrailsAddon().request(flow)
+    assert flow.response.status_code == 403 and len(calls) == 2
 
 
 def test_addon_blocks_a_redacted_file_before_the_text_check(addon, calls, monkeypatch):
     calls.replies = [dict(REDACTED_FILE_VERDICT)]
     text_calls = []
-    monkeypatch.setattr(addon, "post_to_akto", lambda params, payload: text_calls.append(payload) or {})
+    monkeypatch.setattr(addon, "post_to_akto", lambda params, payload: text_calls.append(params) or {})
     flow = anthropic_flow(anthropic_body(PNG))
     addon.AktoGuardrailsAddon().request(flow)
 
@@ -321,7 +369,8 @@ def test_addon_blocks_a_redacted_file_before_the_text_check(addon, calls, monkey
     body = json.loads(flow.response.content)
     assert body["error"] == REDACTED_FILE_VERDICT["reason"]
     assert body["metadata"] == REDACTED_FILE_VERDICT["metadata"]
-    assert text_calls == []  # the request never reaches the text check, let alone the provider
+    # the request never reaches the text check (let alone the provider); it is only ingested
+    assert text_calls == [{"ingest_data": "true"}]
 
 
 def test_addon_runs_text_check_after_allowed_file(addon, calls, monkeypatch):
@@ -337,6 +386,7 @@ def test_addon_runs_text_check_after_allowed_file(addon, calls, monkeypatch):
     # the text check gets a placeholder, not the base64
     assert PNG_B64 not in text_calls[0]["requestPayload"]
     assert "[akto-file sha256:" in text_calls[0]["requestPayload"]
+    assert "name=attachment-1.png check=allowed]" in text_calls[0]["requestPayload"]
 
 
 def test_addon_masking_keeps_the_files(addon, calls, monkeypatch):

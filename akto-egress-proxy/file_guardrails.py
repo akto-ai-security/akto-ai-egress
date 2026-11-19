@@ -17,9 +17,11 @@ keeps no state: every request's files are sent, and guardrails-service remembers
 inspected and allowed (in its Redis, keyed on the bytes and the policies that apply), so a re-sent file
 is answered without being extracted or scanned again, and a policy change applies at once.
 
-The text guardrails get a placeholder in place of each base64 file (scanning base64 as text finds
-nothing and can push the payload over data-ingestion's size limits); restore_files puts the files
-back into a masked payload before it is merged into the request.
+Each file's outcome is recorded per request (see check_files): allowed, uninspected, blocked, not-reached
+or unchecked. The text guardrails - and the traffic Akto ingests for Traces - get a placeholder in place of
+each base64 file, naming it and carrying that outcome; scanning base64 as text finds nothing and can push
+the payload over data-ingestion's size limits. restore_files puts the files back into a masked payload
+before it is merged into the request.
 """
 import base64
 import binascii
@@ -59,9 +61,17 @@ class File(NamedTuple):
     sha256: str
     raw: Optional[str]  # the base64 text as it appears in a JSON body; None for multipart parts
 
-    @property
-    def placeholder(self) -> str:
-        return f"[akto-file sha256:{self.sha256[:16]}]"
+
+# Per-file outcomes check_files records. A verdict covers a whole batch (up to BATCH_SIZE files) and doesn't
+# name the file that failed, so every file in a blocked batch is "blocked".
+ALLOWED, UNINSPECTED, BLOCKED, NOT_REACHED, UNCHECKED = "allowed", "uninspected", "blocked", "not-reached", "unchecked"
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def placeholder(f: File, checks: Optional[dict] = None) -> str:
+    """What stands in for a base64 file in text payloads: its hash, a JSON-safe name and its check outcome."""
+    name = _UNSAFE_NAME_CHARS.sub("_", f.name)[:64]
+    return f"[akto-file sha256:{f.sha256[:16]} name={name} check={(checks or {}).get(f.sha256, UNCHECKED)}]"
 
 
 class FileCheckUnavailable(Exception):
@@ -193,8 +203,13 @@ def find_request_files(body: bytes, content_type: str) -> list:
         return []
 
 
-def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Optional[dict]:
-    """Check the files of a request. Returns {"reason", "metadata"} to block it, else None."""
+def check_files(files: list, fields: dict, url: str, token: Optional[str], checks: Optional[dict] = None) -> Optional[dict]:
+    """Check the files of a request. Returns {"reason", "metadata"} to block it, else None.
+
+    checks, when given, receives each file's outcome by sha256 (see the constants above)."""
+    checks = {} if checks is None else checks
+    for f in files:
+        checks[f.sha256] = UNCHECKED
     pending = {}
     for f in files:
         if len(f.data) > MAX_BYTES:
@@ -211,12 +226,15 @@ def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Op
             batch = files[start:start + BATCH_SIZE]
             verdict = _validate(batch, fields, url, token)
             if verdict.get("allowed") is False or (verdict.get("behaviour") or "").lower() == "block":
+                checks.update({f.sha256: BLOCKED for f in batch})
+                checks.update({f.sha256: NOT_REACHED for f in files[start + BATCH_SIZE:]})
                 return {
                     "reason": verdict.get("reason") or "File blocked by Akto guardrails",
                     "metadata": verdict.get("metadata") or {},
                 }
             if verdict.get("uninspected"):
                 print(f"[AKTO] files allowed without inspection: {[f.name for f in batch]}")
+            checks.update({f.sha256: UNINSPECTED if verdict.get("uninspected") else ALLOWED for f in batch})
     except FileCheckUnavailable as e:
         if FAIL_OPEN:
             print(f"[AKTO] file guardrails call failed, allowing request: {e}")
@@ -226,20 +244,21 @@ def check_files(files: list, fields: dict, url: str, token: Optional[str]) -> Op
     return None
 
 
-def hide_files(text: str, files: list) -> str:
+def hide_files(text: str, files: list, checks: Optional[dict] = None) -> str:
     """Swap each base64 file in a JSON text payload for its placeholder."""
     for f in files:
         if f.raw:
-            text = text.replace(f.raw, f.placeholder)
+            text = text.replace(f.raw, placeholder(f, checks))
     return text
 
 
-def restore_files(text: str, files: list) -> str:
-    """Put the base64 files back into a payload that hide_files produced."""
+def restore_files(text: str, files: list, checks: Optional[dict] = None) -> str:
+    """Put the base64 files back into a payload that hide_files produced (with the same checks)."""
     for f in files:
         if not f.raw:
             continue
-        if f.placeholder not in text:
+        marker = placeholder(f, checks)
+        if marker not in text:
             print(f"[AKTO] masked payload lost file {f.name}; it will be missing from the request")
-        text = text.replace(f.placeholder, f.raw)
+        text = text.replace(marker, f.raw)
     return text
