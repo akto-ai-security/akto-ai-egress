@@ -307,6 +307,7 @@ def test_addon_blocks_request_on_blocked_file_without_text_check(addon, calls):
     assert json.loads(flow.response.content)["error"] == "injection in image"
     assert [c["url"] for c in calls] == ["https://akto.example/api/validate/file"]
     assert calls[0]["data"]["path"] == "/v1/messages" and calls[0]["data"]["contextSource"] == "AGENTIC"
+    assert calls[0]["data"]["ingest_data"] == "true"  # data-ingestion records the check in Traces
 
 
 def test_addon_blocks_a_redacted_file_before_the_text_check(addon, calls, monkeypatch):
