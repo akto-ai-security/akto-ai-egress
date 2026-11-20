@@ -226,7 +226,10 @@ class AktoGuardrailsAddon:
         )
         flow.metadata["akto_files"] = files
         if files and AKTO_FILE_URL:
-            blocked = file_guardrails.check_files(files, akto_fields(flow), AKTO_FILE_URL, AKTO_TOKEN)
+            # ingest_data: data-ingestion records the file check (the text read from each file and the
+            # verdict) in Traces, blocked or allowed.
+            fields = {**akto_fields(flow), "ingest_data": "true"}
+            blocked = file_guardrails.check_files(files, fields, AKTO_FILE_URL, AKTO_TOKEN)
             if blocked:
                 flow.response = block_response(**blocked)
                 return
